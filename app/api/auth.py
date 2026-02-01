@@ -46,7 +46,9 @@ def register(user: UserRegister, session: Session = Depends(get_session)):
     # Создание нового пользователя
     new_user = User(
         email=user.email,
-        password_hash=hash_password(user.password)
+        password_hash=hash_password(user.password),
+        role="patient",
+        is_active=True
     )
 
     try:
@@ -55,7 +57,12 @@ def register(user: UserRegister, session: Session = Depends(get_session)):
         session.refresh(new_user)
 
         logger.info(f"User registered successfully: {new_user.id} ({new_user.email})")
-        return UserResponse(id=new_user.id, email=new_user.email)
+        return UserResponse(
+            id=new_user.id,
+            email=new_user.email,
+            role=new_user.role,
+            is_active=new_user.is_active
+        )
 
     except Exception as e:
         session.rollback()
@@ -105,12 +112,13 @@ def login(user: UserLogin, session: Session = Depends(get_session)):
 
     # Генерация токена
     try:
-        token = create_access_token({"sub": str(db_user.id)})
+        token = create_access_token({"sub": str(db_user.id), "role": db_user.role})
         logger.info(f"Login successful for user: {db_user.id} ({db_user.email})")
 
         return TokenResponse(
             access_token=token,
-            token_type="bearer"
+            token_type="bearer",
+            role=db_user.role
         )
 
     except Exception as e:
@@ -130,3 +138,29 @@ def health_check():
     """Simple health check endpoint"""
     logger.debug("Health check called")
     return {"status": "healthy", "service": "auth"}
+
+
+# @router.post("/create-admin", include_in_schema=False)
+# def create_admin(
+#         email: str = "admin@example.com",
+#         password: str = "admin123",
+#         session: Session = Depends(get_session)
+# ):
+#     existing_admin = session.exec(
+#         select(User).where(User.email == email)
+#     ).first()
+#
+#     if existing_admin:
+#         return {"message": "Admin already exists"}
+#
+#     admin_user = User(
+#         email=email,
+#         password_hash=hash_password(password),
+#         role="admin",
+#         is_active=True
+#     )
+#
+#     session.add(admin_user)
+#     session.commit()
+#
+#     return {"message": "Admin created", "email": email}
