@@ -22,7 +22,7 @@ class UserResponse(BaseModel):
     is_active: bool  # Добавляем статус
 
     class Config:
-        from_attributes = True  # Ранее илиm_mode = True в Pydantic v1
+        from_attributes = True  # Ранее или m_mode = True в Pydantic v1
 
 
 class TokenResponse(BaseModel):

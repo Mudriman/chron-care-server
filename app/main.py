@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, APIRouter
 from sqlmodel import SQLModel
