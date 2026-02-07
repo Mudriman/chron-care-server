@@ -1,17 +1,23 @@
-# app/api/patient.py
+# -*- coding: utf-8 -*-
+
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlmodel import Session, select, and_
-from typing import List
+from typing import List, Optional
 import logging
 from datetime import timedelta, datetime, timezone
 
 from app.db.session import get_session
-from app.db.models import User, Medication, SymptomEntry, MedicationIntake
+from app.db.models import User, Medication, SymptomEntry, MedicationIntake, get_current_utc_date, RiskScore, DailyContext
 from app.core.dependencies import get_current_patient
 from app.schemas.medication import MedicationCreate, MedicationResponse
 from app.schemas.symptom import SymptomCreate, SymptomResponse
 from app.schemas.intake import IntakeCreate, IntakeResponse
+from app.services.risk.risk_service import RiskService
+from app.schemas.risk import RiskResponse
+from app.services.weather.weather_service import WeatherService
 
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -47,11 +53,11 @@ def create_medication(
             detail=f"Active medication '{medication_data.name}' already exists"
         )
 
-    # ������� ����� ���������
+    # Создаем новое лекарство
     new_medication = Medication(
         **medication_data.dict(),
         user_id=current_user.id,
-        start_date=datetime.now(timezone.utc).date()
+        start_date=get_current_utc_date()
     )
 
     try:
@@ -131,12 +137,12 @@ def delete_medication(
 
     if not medication.is_active:
         logger.info(f"Medication {medication_id} is already inactive")
-        # ����� ������� 200, �.�. ��������� ��� �� - ��������� ���������
+        # Можно вернуть 200, т.к. результат тот же - лекарство неактивно
         return
 
-    # ������������ ���������
+    # Деактивируем лекарство
     medication.is_active = False
-    medication.end_date = datetime.now(timezone.utc).date()
+    medication.end_date = get_current_utc_date()
 
     try:
         session.add(medication)
@@ -164,12 +170,12 @@ def create_symptom(
         session: Session = Depends(get_session)
 ):
     """Report daily symptoms for current patient"""
-    # ���������� ����������� ����, ���� �� �������
-    symptom_date = symptom_data.symptom_date or datetime.now(timezone.utc).date()
+    # Используем сегодняшнюю дату, если не указана
+    symptom_date = symptom_data.symptom_date or get_current_utc_date()
 
     logger.info(f"Creating symptom entry for user {current_user.id}, date: {symptom_date}")
 
-    # ���������, �� ���������� �� ��� ������ �� ��� ����
+    # Проверяем, не существует ли уже запись за эту дату
     existing_entry = session.exec(
         select(SymptomEntry).where(
             SymptomEntry.user_id == current_user.id,
@@ -178,7 +184,7 @@ def create_symptom(
     ).first()
 
     if existing_entry:
-        # ��������� ������������ ������
+        # Обновляем существующую запись
         existing_entry.cough = symptom_data.cough
         existing_entry.breathlessness = symptom_data.breathlessness
         existing_entry.night_symptoms = symptom_data.night_symptoms
@@ -190,7 +196,7 @@ def create_symptom(
         logger.info(f"Symptom entry updated: {existing_entry.id}")
         return existing_entry
 
-    # ������� ����� ������
+    # Создаем новую запись
     new_symptom = SymptomEntry(
         cough=symptom_data.cough,
         breathlessness=symptom_data.breathlessness,
@@ -257,7 +263,10 @@ def create_intake(
     """Mark medication intake for today"""
     logger.info(f"Marking intake for medication {intake_data.medication_id} by user {current_user.id}")
 
-    # ���������, ���������� �� ��������� � ����������� �� ������������
+    intake_date = get_current_utc_date()
+    logger.info(f"Using intake date (UTC): {intake_date}")
+
+    # Проверяем лекарство
     medication = session.get(Medication, intake_data.medication_id)
 
     if not medication:
@@ -282,19 +291,19 @@ def create_intake(
             detail="Cannot mark intake for inactive medication"
         )
 
-    # ���������, �� ���������� �� ��� ������� �� ��� ����
+    # === ИСПРАВЛЕНИЕ 2: Используем правильную дату для поиска ===
     existing_intake = session.exec(
         select(MedicationIntake).where(
             and_(
                 MedicationIntake.user_id == current_user.id,
                 MedicationIntake.medication_id == intake_data.medication_id,
-                MedicationIntake.intake_date == intake_data.intake_date
+                MedicationIntake.intake_date == intake_date  # <-- используем intake_date, не intake_data.intake_date
             )
         )
     ).first()
 
     if existing_intake:
-        # ��������� ������������ �������
+        # Обновляем существующую отметку
         existing_intake.taken = True
         existing_intake.taken_at = datetime.now(timezone.utc)
 
@@ -305,10 +314,11 @@ def create_intake(
         logger.info(f"Intake updated: {existing_intake.id}")
         return existing_intake
 
-    # ������� ����� �������
+    # === ИСПРАВЛЕНИЕ 3: Явно указываем intake_date при создании ===
     new_intake = MedicationIntake(
-        **intake_data.dict(),
         user_id=current_user.id,
+        medication_id=intake_data.medication_id,
+        intake_date=intake_date,  # <-- ЯВНО указываем
         taken=True,
         taken_at=datetime.now(timezone.utc)
     )
@@ -340,7 +350,7 @@ def get_today_intakes(
         session: Session = Depends(get_session)
 ):
     """Get medication intakes for today"""
-    today = datetime.now(timezone.utc).date()
+    today = get_current_utc_date()
 
     intakes = session.exec(
         select(MedicationIntake).where(
@@ -353,3 +363,148 @@ def get_today_intakes(
 
     logger.info(f"Retrieved {len(intakes)} intakes for today for user {current_user.id}")
     return intakes
+
+risk_service = RiskService()
+
+
+@router.get(
+    "/risk",
+    response_model=RiskResponse,
+    summary="Get today's risk score"
+)
+def get_today_risk(
+        current_user: User = Depends(get_current_patient),
+        session: Session = Depends(get_session)
+):
+    today = datetime.now(timezone.utc).date()
+
+    return risk_service.calculate_and_save(
+        session,
+        current_user.id,
+        today
+    )
+
+
+@router.get(
+    "/history",
+    response_model=List[RiskResponse]
+)
+def get_risk_history(
+        days: int = Query(30, ge=1, le=365),
+        current_user: User = Depends(get_current_patient),
+        session: Session = Depends(get_session)
+):
+    from datetime import timedelta
+
+    start_date = datetime.now(timezone.utc).date() - timedelta(days=days)
+
+    return session.exec(
+        select(RiskScore).where(
+            RiskScore.user_id == current_user.id,
+            RiskScore.risk_date >= start_date
+        ).order_by(RiskScore.risk_date.desc())
+    ).all()
+
+
+@router.post(
+    "/context/update",
+    summary="Обновить контекст дня (погодные данные)",
+    description="Автоматически получает и сохраняет погодные данные для местоположения пользователя"
+)
+async def update_daily_context(
+        latitude: Optional[float] = Query(None, description="Широта местоположения"),
+        longitude: Optional[float] = Query(None, description="Долгота местоположения"),
+        city_name: Optional[str] = Query(None, description="Название города (альтернатива координатам)"),
+        current_user: User = Depends(get_current_patient),
+        session: Session = Depends(get_session)
+):
+    """Обновляет контекст дня с погодными данными"""
+    today = get_current_utc_date()
+
+    # Если координаты не указаны, пытаемся получить по названию города
+    if latitude is None or longitude is None:
+        if city_name:
+            try:
+                geolocator = Nominatim(user_agent="chroncare_app")
+                location = geolocator.geocode(city_name, timeout=10)
+                if location:
+                    latitude, longitude = location.latitude, location.longitude
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Не удалось определить координаты города"
+                    )
+            except GeocoderTimedOut:
+                raise HTTPException(
+                    status_code=408,
+                    detail="Таймаут при определении местоположения"
+                )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Укажите либо координаты (latitude, longitude), либо название города"
+            )
+
+    # Получаем погодные данные
+    weather_data = await WeatherService.fetch_weather_data(latitude, longitude)
+
+    if not weather_data:
+        raise HTTPException(
+            status_code=500,
+            detail="Не удалось получить погодные данные"
+        )
+
+    # Проверяем существующую запись за сегодня
+    existing_context = session.exec(
+        select(DailyContext).where(
+            DailyContext.user_id == current_user.id,
+            DailyContext.context_date == today
+        )
+    ).first()
+
+    if existing_context:
+        # Обновляем существующую запись
+        existing_context.temperature = weather_data["temperature"]
+        existing_context.humidity = weather_data["humidity"]
+        existing_context.pollen_index = weather_data["pollen_index"]
+        existing_context.air_quality_index = weather_data["air_quality_index"]
+
+        session.add(existing_context)
+        context_record = existing_context
+    else:
+        # Создаем новую запись
+        context_record = DailyContext(
+            user_id=current_user.id,
+            context_date=today,
+            temperature=weather_data["temperature"],
+            humidity=weather_data["humidity"],
+            pollen_index=weather_data["pollen_index"],
+            air_quality_index=weather_data["air_quality_index"]
+        )
+        session.add(context_record)
+
+    try:
+        session.commit()
+        session.refresh(context_record)
+
+        logger.info(f"Weather context updated for user {current_user.id}")
+
+        return {
+            "status": "success",
+            "message": "Контекст дня обновлен",
+            "date": today.isoformat(),
+            "data": {
+                "temperature": context_record.temperature,
+                "humidity": context_record.humidity,
+                "pollen_index": context_record.pollen_index,
+                "air_quality_index": context_record.air_quality_index
+            }
+        }
+
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error saving context: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ошибка сохранения данных: {str(e)}"
+        )

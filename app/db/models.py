@@ -73,7 +73,7 @@ class MedicationIntake(SQLModel, table=True):
     user_id: int = Field(foreign_key="user.id")
     medication_id: int = Field(foreign_key="medication.id")
 
-    intake_date: date = Field(default_factory=get_current_utc_date)
+    intake_date: Optional[date] = None
     taken: bool = Field(default=False)
     taken_at: Optional[datetime] = None
 
