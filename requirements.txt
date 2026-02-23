@@ -1,8 +1,0 @@
-fastapi
-uvicorn[standard]
-sqlmodel
-psycopg2-binary
-alembic
-python-jose
-passlib[bcrypt]
-python-dotenv
